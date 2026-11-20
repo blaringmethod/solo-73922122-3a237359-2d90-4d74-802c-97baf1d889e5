@@ -19,6 +19,7 @@ from .db import close_pool, get_pool, init_pool
 from .models import (
     ChangeSet,
     CorrectRequest,
+    ManualReadingIn,
     MergeRequest,
     ObservationIn,
     SplitRequest,
@@ -27,11 +28,14 @@ from .models import (
     to_utc,
 )
 
-DESCRIPTION = """维护站点-流域归属时段与站点观测。
+DESCRIPTION = """维护站点-流域归属时段、站点观测与断网期间的人工水尺抄报。
 
 * 时段左闭右开 `[valid_from, valid_to)`，终点可空（至今有效）
 * 同站时段不得重叠；每条观测须恰有一段归属
 * `/changesets` 可在一笔事务内拆分/合并/更正时段并补改观测，中途允许暂时违规，提交时统一校验
+* `/manual-readings` 登记人工抄报：同站同刻仅一条，须有流域归属且同刻无自动读数；
+  自动读数提交成功后抄报永久退出供数（删自动读数也不恢复），原值/单号/退出状态仍可查
+* `/readings` 统一供数，含来源 `automatic` / `manual`；抄报失去归属时自动暂停供数
 * 冲突（含并发冲突、死锁）整笔拒绝，返回 409
 """
 
@@ -163,6 +167,85 @@ def create_observation(body: ObservationIn):
         return {"observation_id": row["observation_id"]}
 
     return run_txn(fn)
+
+
+# ---------------------------------------------------------------------------
+# 人工抄报(水尺抄报): 断网期间的临时读数登记
+# ---------------------------------------------------------------------------
+
+@app.post("/manual-readings", status_code=201, tags=["manual-readings"])
+def register_manual_reading(body: ManualReadingIn):
+    """登记一条水尺抄报。
+
+    接收条件（数据库提交时强校验，API 与直连 SQL 同规则）：
+
+    * 同站同刻只登记一次（重复登记返回 409）；
+    * 采样时刻必须有流域归属（落在某归属时段内），否则 409；
+    * 同站同刻不得已有自动读数，否则 409。
+
+    同站同刻自动读数一旦成功提交，本抄报永久退出供数（withdrawn=true），
+    即使自动读数后来被删除也不恢复；原值、单号、退出状态仍可经
+    `/manual-readings` 台账查询。
+    """
+    at = to_utc(body.observed_at)
+
+    def fn(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM stations WHERE station_id = %s", (body.station_id,)
+        ).fetchone()
+        if exists is None:
+            raise HTTPException(status_code=404, detail=f"station {body.station_id} not found")
+        row = conn.execute(
+            """
+            INSERT INTO manual_readings (station_id, observed_at, value, report_no)
+            VALUES (%s, %s, %s, %s)
+            RETURNING manual_reading_id, withdrawn
+            """,
+            (body.station_id, at, body.value, body.report_no),
+        ).fetchone()
+        return {
+            "manual_reading_id": row["manual_reading_id"],
+            "station_id": body.station_id,
+            "observed_at": at,
+            "value": body.value,
+            "report_no": body.report_no,
+            "withdrawn": row["withdrawn"],
+        }
+
+    return run_txn(fn)
+
+
+@app.get("/manual-readings", tags=["manual-readings"])
+def list_manual_readings(
+    station_id: str,
+    from_: Optional[datetime] = Query(None, alias="from"),
+    to: Optional[datetime] = Query(None),
+    include_withdrawn: bool = Query(True, description="是否包含已退出供数的抄报"),
+):
+    """抄报台账：按站号与 UTC 时段查询同一已提交状态。
+
+    返回每条抄报登记时/采样时的流域（watershed；失去归属时为 null，
+    即"暂停供数"）、测值、抄报单号与退出状态 withdrawn。
+    """
+    sql = """
+        SELECT manual_reading_id, station_id, observed_at, value, report_no,
+               withdrawn, withdrawn_at, created_at, watershed, period_id
+        FROM manual_reading_status
+        WHERE station_id = %s
+    """
+    params: list = [station_id]
+    if from_ is not None:
+        sql += " AND observed_at >= %s"
+        params.append(from_)
+    if to is not None:
+        sql += " AND observed_at < %s"
+        params.append(to)
+    if not include_withdrawn:
+        sql += " AND withdrawn = false"
+    sql += " ORDER BY observed_at"
+    pool = get_pool()
+    with pool.connection() as conn:
+        return conn.execute(sql, params).fetchall()
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +503,45 @@ def attributed_feed(
     if station_id is not None:
         sql += " AND station_id = %s"
         params.append(station_id)
+    if from_ is not None:
+        sql += " AND observed_at >= %s"
+        params.append(from_)
+    if to is not None:
+        sql += " AND observed_at < %s"
+        params.append(to)
+    sql += " ORDER BY station_id, observed_at"
+    pool = get_pool()
+    with pool.connection() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+@app.get("/readings", tags=["feed"])
+def readings_feed(
+    station_id: Optional[str] = None,
+    from_: Optional[datetime] = Query(None, alias="from"),
+    to: Optional[datetime] = Query(None),
+    source: Optional[str] = Query(None, pattern="^(automatic|manual)$"),
+):
+    """统一供数：自动读数与生效中的人工抄报，含 `source` 来源标记与抄报单号。
+
+    * 自动读数（source=automatic）：完整性约束保证恒有流域归属；
+    * 人工抄报（source=manual）：失去归属时自动暂停供数（不返回），
+      被自动读数顶替（withdrawn）后永久不返回；
+    * 同站同刻自动读数已提交时，该时刻只返回 automatic 一条。
+    """
+    sql = """
+        SELECT reading_id, station_id, observed_at, value, watershed,
+               source, report_no, period_id
+        FROM reading_feed
+        WHERE TRUE
+    """
+    params: list = []
+    if station_id is not None:
+        sql += " AND station_id = %s"
+        params.append(station_id)
+    if source is not None:
+        sql += " AND source = %s"
+        params.append(source)
     if from_ is not None:
         sql += " AND observed_at >= %s"
         params.append(from_)

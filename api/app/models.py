@@ -25,6 +25,15 @@ class ObservationIn(BaseModel):
     value: float
 
 
+class ManualReadingIn(BaseModel):
+    """断网期间值班员水尺抄报登记."""
+
+    station_id: str = Field(min_length=1, max_length=64)
+    observed_at: AwareDatetime
+    value: float
+    report_no: str = Field(min_length=1, max_length=128)
+
+
 # ---------------------------------------------------------------------------
 # 变更集操作(一笔事务内按序执行, 提交时统一校验)
 # ---------------------------------------------------------------------------
